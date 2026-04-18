@@ -2,20 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
-import math
-import random
-import struct
-import wave
-
+import math, random, struct, wave
 import dearpygui.dearpygui as dpg
 
 SR = 44100
-TICKS_PER_QUARTER = 960
+TPQ = 960
 random.seed(0)
 
-
-# ---------------- musical time ----------------
 
 @dataclass
 class Meter:
@@ -61,7 +54,6 @@ class PianoRoll:
 class Recording:
     name: str
     length_ticks: int
-    sample_path: str = ""
 
 
 class BlockKind(str, Enum):
@@ -80,7 +72,7 @@ class BlockRef:
 class Block:
     ref: BlockRef
     start_tick: int
-    length_ticks: Optional[int] = None
+    length_ticks: int | None = None
     loop: bool = False
     muted: bool = False
 
@@ -95,7 +87,7 @@ class Track:
 
 @dataclass
 class Song:
-    bpm: float
+    bpm: float = 142.0
     meter: Meter = field(default_factory=Meter)
     patterns: dict[int, Pattern] = field(default_factory=dict)
     piano_rolls: dict[int, PianoRoll] = field(default_factory=dict)
@@ -106,182 +98,182 @@ class Song:
 @dataclass
 class DAW:
     song: Song
-    px_per_beat: float = 72.0
+    px_per_beat: float = 48.0
     track_height: int = 96
-    timeline_total_beats: int = 2048
+    timeline_beats: int = 2048
+    undo: list[list[tuple]] = field(default_factory=list)
+    redo: list[list[tuple]] = field(default_factory=list)
     dirty: bool = True
 
 
-# ---------------- conversions ----------------
-
+# ---------- time ----------
 def ticks_per_beat(song: Song) -> int:
-    return max(1, (TICKS_PER_QUARTER * 4) // max(1, song.meter.denominator))
+    return TPQ * 4 // song.meter.denominator
 
 
 def ticks_per_bar(song: Song) -> int:
-    return max(1, song.meter.numerator * ticks_per_beat(song))
+    return song.meter.numerator * ticks_per_beat(song)
+
+
+def seconds_per_tick(song: Song) -> float:
+    return (60.0 / song.bpm) / TPQ
 
 
 def ticks_to_seconds(song: Song, ticks: int) -> float:
-    return ticks * (60.0 / song.bpm) / TICKS_PER_QUARTER
-
-
-def ticks_to_beats(song: Song, ticks: int) -> float:
-    return ticks / ticks_per_beat(song)
-
-
-def beats_to_ticks(song: Song, beats: float) -> int:
-    return int(round(beats * ticks_per_beat(song)))
+    return ticks * seconds_per_tick(song)
 
 
 def px_per_tick(daw: DAW) -> float:
     return daw.px_per_beat / ticks_per_beat(daw.song)
 
 
-def step_to_ticks(step: int) -> int:
-    return step * (TICKS_PER_QUARTER // 4)
+# ---------- tiny history ----------
+def access(root, key):
+    return getattr(root, key) if isinstance(key, str) else root[key]
 
 
-def make_note_from_steps(step: int, length: int, pitch: int, velocity: float = 1.0) -> Note:
-    return Note(start_tick=step_to_ticks(step), length_ticks=step_to_ticks(length), pitch=pitch, velocity=velocity)
+def parent_key(root, path):
+    cur = root
+    for key in path[:-1]:
+        cur = access(cur, key)
+    return cur, path[-1]
 
 
-# ---------------- model helpers ----------------
-
-def resolve_block_source(song: Song, ref: BlockRef):
-    if ref.kind == BlockKind.PATTERN:
-        return song.patterns[ref.object_id]
-    if ref.kind == BlockKind.PIANO_ROLL:
-        return song.piano_rolls[ref.object_id]
-    if ref.kind == BlockKind.RECORDING:
-        return song.recordings[ref.object_id]
-    raise KeyError(ref.kind)
+def seq(root, path):
+    cur = root
+    for key in path:
+        cur = access(cur, key)
+    return cur
 
 
-def block_length_ticks(song: Song, block: Block) -> int:
-    if block.length_ticks is not None:
-        return block.length_ticks
-    return resolve_block_source(song, block.ref).length_ticks
+def apply_ops(song: Song, ops: list[tuple], undo: bool = False) -> None:
+    for op in (reversed(ops) if undo else ops):
+        kind = op[0]
+        if kind == "set":
+            _, path, old, new = op
+            parent, key = parent_key(song, path)
+            value = old if undo else new
+            setattr(parent, key, value) if isinstance(key, str) else parent.__setitem__(key, value)
+        elif kind == "insert":
+            _, path, index, value = op
+            (seq(song, path).pop(index) if undo else seq(song, path).insert(index, value))
+        elif kind == "delete":
+            _, path, index, value = op
+            (seq(song, path).insert(index, value) if undo else seq(song, path).pop(index))
+
+
+def do(daw: DAW, ops: list[tuple], msg: str = "") -> None:
+    if not ops:
+        return
+    apply_ops(daw.song, ops)
+    daw.undo.append(ops)
+    daw.redo.clear()
+    daw.dirty = True
+    if msg and dpg.does_item_exist("status"):
+        dpg.set_value("status", msg)
+
+
+def undo(daw: DAW) -> None:
+    if daw.undo:
+        ops = daw.undo.pop()
+        apply_ops(daw.song, ops, undo=True)
+        daw.redo.append(ops)
+        daw.dirty = True
+
+
+def redo(daw: DAW) -> None:
+    if daw.redo:
+        ops = daw.redo.pop()
+        apply_ops(daw.song, ops)
+        daw.undo.append(ops)
+        daw.dirty = True
+
+
+# ---------- content ----------
+def resolve(song: Song, ref: BlockRef):
+    return song.patterns[ref.object_id] if ref.kind == BlockKind.PATTERN else song.piano_rolls[ref.object_id] if ref.kind == BlockKind.PIANO_ROLL else song.recordings[ref.object_id]
+
+
+def block_len(song: Song, block: Block) -> int:
+    return block.length_ticks if block.length_ticks is not None else resolve(song, block.ref).length_ticks
 
 
 def selected_tracks(song: Song) -> list[Track]:
-    chosen = [t for t in song.tracks if t.selected]
-    return chosen if chosen else song.tracks
+    picked = [t for t in song.tracks if t.selected]
+    return picked or song.tracks
 
 
-def make_pattern(name: str, step_notes: list[tuple[int, int, int, float]]) -> Pattern:
-    notes = [make_note_from_steps(step, length, pitch, velocity) for step, length, pitch, velocity in step_notes]
-    return Pattern(name=name, length_ticks=step_to_ticks(16), notes=notes)
+def next_pattern_id(song: Song) -> int:
+    return max(song.patterns.keys() | {0}) + 1
 
 
-def make_roll(name: str, step_notes: list[tuple[int, int, int, float]]) -> PianoRoll:
-    notes = [make_note_from_steps(step, length, pitch, velocity) for step, length, pitch, velocity in step_notes]
-    return PianoRoll(name=name, length_ticks=step_to_ticks(16), notes=notes)
+def step_ticks(song: Song) -> int:
+    return ticks_per_beat(song) // 4
 
 
+def default_pattern(song: Song) -> int:
+    return 0 if 0 in song.patterns else next(iter(song.patterns))
+
+
+# ---------- demo ----------
 def make_demo_daw() -> DAW:
-    song = Song(bpm=142.0, meter=Meter(4, 4))
-
-    song.patterns[0] = make_pattern("kick", [
-        (0, 1, 36, 1.0),
-        (6, 1, 36, 1.0),
-        (11, 1, 36, 1.0),
-    ])
-    song.patterns[1] = make_pattern("snare", [
-        (4, 1, 38, 0.95),
-        (12, 1, 38, 0.95),
-    ])
-    song.patterns[2] = make_pattern("hat", [
-        (step, 1, 42, 0.35 if step % 4 else 0.65) for step in range(16)
-    ])
-    song.piano_rolls[0] = make_roll("808", [
-        (0, 4, 36, 1.0),
-        (6, 2, 36, 1.0),
-        (8, 4, 34, 1.0),
-        (12, 4, 31, 1.0),
-    ])
-
-    kick_inst = Instrument(waveform="sine", decay=0.10, pitch_drop=24.0, click=0.20)
-    snare_inst = Instrument(waveform="square", decay=0.05, noise=0.65, click=0.08)
-    hat_inst = Instrument(waveform="noise", decay=0.02, noise=0.85)
-    bass_inst = Instrument(waveform="sine", decay=0.20, sustain=0.85, release=0.08, pitch_drop=7.0, click=0.02)
-
-    one_bar = step_to_ticks(16)
+    song = Song()
+    s = step_ticks(song)
+    song.patterns[0] = Pattern("kick", 16 * s, [Note(0 * s, 1 * s, 36), Note(6 * s, 1 * s, 36), Note(11 * s, 1 * s, 36)])
+    song.patterns[1] = Pattern("snare", 16 * s, [Note(4 * s, 1 * s, 38, 0.95), Note(12 * s, 1 * s, 38, 0.95)])
+    song.patterns[2] = Pattern("hat", 16 * s, [Note(i * s, 1 * s, 42, 0.35 if i % 4 else 0.65) for i in range(16)])
+    song.piano_rolls[0] = PianoRoll("808", 16 * s, [Note(0 * s, 4 * s, 36), Note(6 * s, 2 * s, 36), Note(8 * s, 4 * s, 34), Note(12 * s, 4 * s, 31)])
+    kick = Instrument("sine", decay=0.10, pitch_drop=24.0, click=0.20)
+    snare = Instrument("square", decay=0.05, noise=0.65, click=0.08)
+    hat = Instrument("noise", decay=0.02, noise=0.85)
+    bass = Instrument("sine", decay=0.20, sustain=0.85, release=0.08, pitch_drop=7.0, click=0.02)
     song.tracks = [
-        Track("kick", kick_inst, True, [
-            Block(BlockRef(BlockKind.PATTERN, 0), 0),
-            Block(BlockRef(BlockKind.PATTERN, 0), one_bar),
-        ]),
-        Track("snare", snare_inst, True, [
-            Block(BlockRef(BlockKind.PATTERN, 1), 0),
-            Block(BlockRef(BlockKind.PATTERN, 1), one_bar),
-        ]),
-        Track("hat", hat_inst, True, [
-            Block(BlockRef(BlockKind.PATTERN, 2), 0),
-            Block(BlockRef(BlockKind.PATTERN, 2), one_bar),
-        ]),
-        Track("808", bass_inst, True, [
-            Block(BlockRef(BlockKind.PIANO_ROLL, 0), 0),
-            Block(BlockRef(BlockKind.PIANO_ROLL, 0), one_bar),
-        ]),
+        Track("kick", kick, True, [Block(BlockRef(BlockKind.PATTERN, 0), 0, 16 * s), Block(BlockRef(BlockKind.PATTERN, 0), 16 * s, 16 * s)]),
+        Track("snare", snare, True, [Block(BlockRef(BlockKind.PATTERN, 1), 0, 16 * s), Block(BlockRef(BlockKind.PATTERN, 1), 16 * s, 16 * s)]),
+        Track("hat", hat, True, [Block(BlockRef(BlockKind.PATTERN, 2), 0, 16 * s), Block(BlockRef(BlockKind.PATTERN, 2), 16 * s, 16 * s)]),
+        Track("808", bass, True, [Block(BlockRef(BlockKind.PIANO_ROLL, 0), 0, 16 * s), Block(BlockRef(BlockKind.PIANO_ROLL, 0), 16 * s, 16 * s)]),
     ]
-    return DAW(song=song)
+    return DAW(song)
 
 
-# ---------------- audio ----------------
-
+# ---------- audio ----------
 def midi_to_hz(m: int) -> float:
     return 440.0 * (2.0 ** ((m - 69) / 12.0))
 
 
 def osc_sample(waveform: str, phase: float) -> float:
     x = phase - math.floor(phase)
-    if waveform == "sine":
-        return math.sin(2 * math.pi * x)
-    if waveform == "square":
-        return 1.0 if x < 0.5 else -1.0
-    if waveform == "saw":
-        return 2.0 * x - 1.0
-    if waveform == "noise":
-        return random.uniform(-1.0, 1.0)
+    if waveform == "sine": return math.sin(2 * math.pi * x)
+    if waveform == "square": return 1.0 if x < 0.5 else -1.0
+    if waveform == "saw": return 2.0 * x - 1.0
+    if waveform == "noise": return random.uniform(-1.0, 1.0)
     return math.sin(2 * math.pi * x)
 
 
 def adsr(inst: Instrument, t: float, hold: float) -> float:
     a, d, s, r = inst.attack, inst.decay, inst.sustain, inst.release
-    if a > 0 and t < a:
-        return t / a
+    if a > 0 and t < a: return t / a
     t2 = t - a
-    if d > 0 and t2 < d:
-        return 1.0 + (s - 1.0) * (t2 / d)
-    if t < hold:
-        return s
-    if r <= 0:
-        return 0.0
+    if d > 0 and t2 < d: return 1.0 + (s - 1.0) * (t2 / d)
+    if t < hold: return s
+    if r <= 0: return 0.0
     rel_t = t - hold
-    if rel_t < r:
-        return s * (1.0 - rel_t / r)
-    return 0.0
+    return s * (1.0 - rel_t / r) if rel_t < r else 0.0
 
 
 def render_note(song: Song, inst: Instrument, note: Note) -> list[float]:
     hold = max(0.0, ticks_to_seconds(song, note.length_ticks))
     total = hold + inst.release
     n = max(1, int(total * SR))
-    out = [0.0] * n
-    base_hz = midi_to_hz(note.pitch)
-    phase = 0.0
-
+    out, base_hz, phase = [0.0] * n, midi_to_hz(note.pitch), 0.0
     for i in range(n):
         t = i / SR
         env = adsr(inst, t, hold)
         if env <= 0.0:
             continue
         if inst.pitch_drop > 0.0:
-            drop_window = min(0.08, total)
-            frac = min(1.0, t / max(drop_window, 1e-9))
-            semis = inst.pitch_drop * (1.0 - frac)
-            hz = base_hz * (2.0 ** (semis / 12.0))
+            frac = min(1.0, t / max(min(0.08, total), 1e-9))
+            hz = base_hz * (2.0 ** ((inst.pitch_drop * (1.0 - frac)) / 12.0))
         else:
             hz = base_hz
         phase += hz / SR
@@ -292,20 +284,18 @@ def render_note(song: Song, inst: Instrument, note: Note) -> list[float]:
     return out
 
 
-def iter_block_notes(song: Song, block: Block):
-    source = resolve_block_source(song, block.ref)
+def iter_notes(song: Song, block: Block):
+    source = resolve(song, block.ref)
     if isinstance(source, Recording):
         return
-    clip_len = block_length_ticks(song, block)
-    src_len = max(1, source.length_ticks)
+    clip_len, src_len = block_len(song, block), max(1, source.length_ticks)
     if block.loop and clip_len > src_len:
         k = 0
         while k * src_len < clip_len:
             off = k * src_len
             for note in source.notes:
-                rel = off + note.start_tick
-                if rel < clip_len:
-                    yield rel, note
+                if off + note.start_tick < clip_len:
+                    yield off + note.start_tick, note
             k += 1
     else:
         for note in source.notes:
@@ -314,32 +304,24 @@ def iter_block_notes(song: Song, block: Block):
 
 
 def song_end_tick(song: Song) -> int:
-    end_tick = ticks_per_bar(song) * 2
+    end = ticks_per_bar(song) * 2
     for track in selected_tracks(song):
         for block in track.blocks:
-            end_tick = max(end_tick, block.start_tick + block_length_ticks(song, block))
-    return end_tick
+            end = max(end, block.start_tick + block_len(song, block))
+    return end
 
 
-def render_song_to_samples(song: Song) -> list[float]:
-    total_seconds = ticks_to_seconds(song, song_end_tick(song)) + 0.25
-    n_samples = max(1, int(total_seconds * SR))
-    mix = [0.0] * n_samples
-
+def render_song(song: Song) -> list[float]:
+    mix = [0.0] * max(1, int((ticks_to_seconds(song, song_end_tick(song)) + 0.25) * SR))
     for track in selected_tracks(song):
         for block in track.blocks:
             if block.muted:
                 continue
-            source = resolve_block_source(song, block.ref)
-            if isinstance(source, Recording):
-                continue
-            for rel_start_tick, note in iter_block_notes(song, block):
-                start = int(ticks_to_seconds(song, block.start_tick + rel_start_tick) * SR)
+            for rel, note in iter_notes(song, block):
+                start = int(ticks_to_seconds(song, block.start_tick + rel) * SR)
                 audio = render_note(song, track.instrument, note)
-                end = min(n_samples, start + len(audio))
-                for j in range(end - start):
+                for j in range(min(len(audio), len(mix) - start)):
                     mix[start + j] += audio[j]
-
     for i, x in enumerate(mix):
         mix[i] = math.tanh(1.4 * x)
     return mix
@@ -350,266 +332,256 @@ def write_wav(path: str, samples: list[float]) -> None:
         wf.setnchannels(1)
         wf.setsampwidth(2)
         wf.setframerate(SR)
-        frames = bytearray()
-        for s in samples:
-            s = max(-1.0, min(1.0, s))
-            frames += struct.pack("<h", int(s * 32767))
-        wf.writeframes(frames)
+        frames = bytearray(struct.pack("<h", int(max(-1.0, min(1.0, s)) * 32767)) for s in samples)
+        wf.writeframes(b"".join(frames))
 
 
-# ---------------- gui ----------------
-TOP_BAR = "top_bar"
-ROWS = "rows_panel"
-SCROLLER = "timeline_scroll"
-DRAWLIST = "timeline_drawlist"
-STATUS = "status_text"
-BPM = "bpm_input"
-METER_NUM = "meter_num_input"
-METER_DEN = "meter_den_input"
-PX = "px_per_beat_input"
-TRACK_H = "track_height_input"
-
-LEFT_PAD = 10
-TOP_PAD = 10
-HEADER_H = 34
-TRACK_GAP = 10
-LANE_BG = (24, 24, 27, 255)
-LANE_BORDER = (62, 62, 66, 255)
-GRID_MINOR = (48, 48, 52, 255)
-GRID_MAJOR = (92, 92, 98, 255)
-TEXT = (232, 214, 92, 255)
-TEXT_SOFT = (180, 166, 88, 255)
-BLOCK_FILL = {
-    BlockKind.PATTERN: (184, 146, 28, 255),
-    BlockKind.PIANO_ROLL: (214, 178, 42, 255),
-    BlockKind.RECORDING: (140, 114, 30, 255),
-}
+# ---------- ui ----------
+ROOT, ROWS, SCROLLER, DRAWLIST = "root", "rows", "scroll", "draw"
+LEFT_PAD, TOP_PAD, HEADER_H, TRACK_GAP = 12, 12, 34, 10
+LANE_BG, LANE_BORDER = (22, 22, 24, 255), (70, 70, 76, 255)
+GRID_MINOR, GRID_MAJOR = (45, 45, 48, 255), (214, 178, 42, 255)
+TEXT, TEXT_SOFT = (238, 214, 96, 255), (220, 220, 220, 255)
+FILL = {BlockKind.PATTERN: (184, 146, 28, 255), BlockKind.PIANO_ROLL: (214, 178, 42, 255), BlockKind.RECORDING: (140, 114, 30, 255)}
 
 
-class Runtime:
-    def __init__(self) -> None:
-        self.last_sig = None
-
-
-RUNTIME = Runtime()
-
-
-def mark_dirty(daw: DAW, msg: str = "") -> None:
-    daw.dirty = True
-    if msg and dpg.does_item_exist(STATUS):
-        dpg.set_value(STATUS, msg)
-
-
-def sync_top_bar(daw: DAW) -> None:
-    dpg.set_value(BPM, daw.song.bpm)
-    dpg.set_value(METER_NUM, daw.song.meter.numerator)
-    dpg.set_value(METER_DEN, daw.song.meter.denominator)
-    dpg.set_value(PX, daw.px_per_beat)
-    dpg.set_value(TRACK_H, daw.track_height)
-
-
-def rebuild_rows(daw: DAW) -> None:
-    dpg.delete_item(ROWS, children_only=True)
-    for i, track in enumerate(daw.song.tracks):
-        with dpg.group(horizontal=True, parent=ROWS):
-            dpg.add_checkbox(default_value=track.selected, callback=on_track_selected, user_data=(daw, i))
-            dpg.add_text(track.name)
-            dpg.add_spacer(height=max(0, daw.track_height - 24))
-
-
-def draw_pattern_contents(drawlist: str, song: Song, x0: float, y0: float, y1: float, source: Pattern | PianoRoll, kind: BlockKind, pptick: float):
-    if kind == BlockKind.PATTERN:
+def draw_pattern_preview(drawlist: str, daw: DAW, block: Block, x0: float, y0: float, y1: float) -> None:
+    source = resolve(daw.song, block.ref)
+    ppt = daw.px_per_beat
+    if isinstance(source, Recording):
+        mid, prev, steps = (y0 + y1) / 2, None, max(8, int((block_len(daw.song, block) * px_per_tick(daw)) / 10))
+        for k in range(steps + 1):
+            xx = x0 + (block_len(daw.song, block) * px_per_tick(daw)) * k / steps
+            yy = mid + math.sin(0.35 * k) * (daw.track_height * 0.12)
+            if prev: dpg.draw_line(prev, (xx, yy), color=(32, 32, 32, 255), thickness=2, parent=drawlist)
+            prev = (xx, yy)
+        return
+    if block.ref.kind == BlockKind.PATTERN:
+        hit_w = max(2.0, ppt * 0.12)
         for note in source.notes:
-            nx0 = x0 + note.start_tick * pptick
-            nx1 = max(nx0 + 2, nx0 + note.length_ticks * pptick)
-            dpg.draw_line((nx0, y0 + 4), (nx0, y1 - 4), color=(32, 32, 32, 255), thickness=2, parent=drawlist)
-            dpg.draw_rectangle((nx0, y1 - 12), (nx1, y1 - 6), fill=(32, 32, 32, 255), color=(32, 32, 32, 255), parent=drawlist)
+            nx = x0 + note.start_tick * px_per_tick(daw)
+            dpg.draw_rectangle((nx, y1 - 12), (nx + hit_w, y1 - 6), fill=(30, 30, 30, 255), color=(30, 30, 30, 255), parent=drawlist)
     else:
-        if not source.notes:
-            return
-        pitches = [n.pitch for n in source.notes]
-        lo, hi = min(pitches), max(pitches)
+        lo, hi = min(n.pitch for n in source.notes), max(n.pitch for n in source.notes)
         span = max(1, hi - lo)
         for note in source.notes:
             frac = (note.pitch - lo) / span
-            ny0 = y1 - 10 - frac * max(12, (y1 - y0 - 18))
-            ny1 = ny0 + 6
-            nx0 = x0 + note.start_tick * pptick
-            nx1 = max(nx0 + 4, nx0 + note.length_ticks * pptick)
-            dpg.draw_rectangle((nx0, ny0), (nx1, ny1), fill=(32, 32, 32, 255), color=(32, 32, 32, 255), parent=drawlist)
+            ny0 = y1 - 10 - frac * max(12, y1 - y0 - 18)
+            nx0 = x0 + note.start_tick * px_per_tick(daw)
+            nx1 = max(nx0 + max(3.0, ppt * 0.15), nx0 + note.length_ticks * px_per_tick(daw))
+            dpg.draw_rectangle((nx0, ny0), (nx1, ny0 + 6), fill=(30, 30, 30, 255), color=(30, 30, 30, 255), parent=drawlist)
 
 
-def draw_header(drawlist: str, daw: DAW, width: int, height: int) -> None:
-    tpb = ticks_per_beat(daw.song)
-    bar_ticks = ticks_per_bar(daw.song)
-    total_ticks = daw.timeline_total_beats * tpb
-    pptick = px_per_tick(daw)
-
-    for beat_index in range(daw.timeline_total_beats + 1):
-        tick = beat_index * tpb
-        x = LEFT_PAD + tick * pptick
-        is_bar = (tick % bar_ticks) == 0
-        dpg.draw_line((x, HEADER_H), (x, height - TOP_PAD), color=GRID_MAJOR if is_bar else GRID_MINOR, thickness=2 if is_bar else 1, parent=drawlist)
-        if beat_index < daw.timeline_total_beats:
-            if is_bar:
-                bar_number = beat_index // max(1, daw.song.meter.numerator) + 1
-                dpg.draw_text((x + 2, 2), f"|{bar_number}", color=TEXT, size=15, parent=drawlist)
-            dpg.draw_text((x + 2, 16), str(beat_index), color=TEXT_SOFT, size=12, parent=drawlist)
-
-    x_end = LEFT_PAD + total_ticks * pptick
-    dpg.draw_line((x_end, HEADER_H), (x_end, height - TOP_PAD), color=GRID_MINOR, thickness=1, parent=drawlist)
+def draw_header(daw: DAW, w: int, h: int) -> None:
+    tpb, bar = ticks_per_beat(daw.song), ticks_per_bar(daw.song)
+    total_ticks = daw.timeline_beats * tpb
+    for beat in range(daw.timeline_beats + 1):
+        tick = beat * tpb
+        x = LEFT_PAD + tick * px_per_tick(daw)
+        is_bar = (tick % bar) == 0
+        dpg.draw_line((x, HEADER_H), (x, h - TOP_PAD), color=GRID_MAJOR if is_bar else GRID_MINOR, thickness=2 if is_bar else 1, parent=DRAWLIST)
+        if beat < daw.timeline_beats:
+            if is_bar: dpg.draw_text((x + 1, 1), f"|{beat // max(1, daw.song.meter.numerator) + 1}", color=TEXT, size=15, parent=DRAWLIST)
+            dpg.draw_text((x + 1, 16), str(beat), color=TEXT_SOFT, size=12, parent=DRAWLIST)
 
 
 def draw_timeline(daw: DAW) -> None:
     w, h = dpg.get_item_rect_size(SCROLLER)
-    if w <= 10 or h <= 10:
+    if w < 20 or h < 20:
         return
-
-    content_width = max(int(LEFT_PAD * 2 + daw.timeline_total_beats * daw.px_per_beat), int(w - 16))
-    content_height = max(int(HEADER_H + TOP_PAD * 2 + len(daw.song.tracks) * (daw.track_height + TRACK_GAP) + 20), int(h - 16))
-    dpg.configure_item(DRAWLIST, width=content_width, height=content_height)
+    cw = max(int(LEFT_PAD * 2 + daw.timeline_beats * daw.px_per_beat), int(w - 16))
+    ch = max(int(HEADER_H + TOP_PAD * 2 + len(daw.song.tracks) * (daw.track_height + TRACK_GAP) + 20), int(h - 16))
+    dpg.configure_item(DRAWLIST, width=cw, height=ch)
     dpg.delete_item(DRAWLIST, children_only=True)
-    dpg.draw_rectangle((0, 0), (content_width, content_height), fill=(12, 12, 14, 255), color=(12, 12, 14, 255), parent=DRAWLIST)
-
-    draw_header(DRAWLIST, daw, content_width, content_height)
-    pptick = px_per_tick(daw)
-
-    for ti, track in enumerate(daw.song.tracks):
-        y = HEADER_H + TOP_PAD + ti * (daw.track_height + TRACK_GAP)
-        dpg.draw_rectangle((LEFT_PAD, y), (content_width - LEFT_PAD, y + daw.track_height), fill=LANE_BG, color=LANE_BORDER, rounding=6, parent=DRAWLIST)
-        for block in track.blocks:
-            x0 = LEFT_PAD + block.start_tick * pptick
-            x1 = x0 + block_length_ticks(daw.song, block) * pptick
-            y0 = y + 6
-            y1 = y + daw.track_height - 6
-            fill = (92, 92, 96, 255) if block.muted else BLOCK_FILL[block.ref.kind]
-            dpg.draw_rectangle((x0, y0), (x1, y1), fill=fill, color=(20, 20, 20, 255), rounding=6, parent=DRAWLIST)
-            src = resolve_block_source(daw.song, block.ref)
-            dpg.draw_text((x0 + 6, y0 + 6), src.name, color=(18, 18, 18, 255), size=14, parent=DRAWLIST)
-            if isinstance(src, (Pattern, PianoRoll)):
-                draw_pattern_contents(DRAWLIST, daw.song, x0 + 4, y0 + 24, y1 - 4, src, block.ref.kind, pptick)
-            else:
-                mid = (y0 + y1) / 2
-                prev = None
-                steps = max(8, int((x1 - x0) / 10))
-                for k in range(steps + 1):
-                    xx = x0 + (x1 - x0) * k / steps
-                    yy = mid + math.sin(0.35 * k) * (daw.track_height * 0.12)
-                    if prev is not None:
-                        dpg.draw_line(prev, (xx, yy), color=(32, 32, 32, 255), thickness=2, parent=DRAWLIST)
-                    prev = (xx, yy)
+    dpg.draw_rectangle((0, 0), (cw, ch), fill=(10, 10, 12, 255), color=(10, 10, 12, 255), parent=DRAWLIST)
+    draw_header(daw, cw, ch)
+    for i, track in enumerate(daw.song.tracks):
+        y = HEADER_H + TOP_PAD + i * (daw.track_height + TRACK_GAP)
+        dpg.draw_rectangle((LEFT_PAD, y), (cw - LEFT_PAD, y + daw.track_height), fill=LANE_BG, color=LANE_BORDER, rounding=6, parent=DRAWLIST)
+        for block in sorted(track.blocks, key=lambda b: b.start_tick):
+            x0 = LEFT_PAD + block.start_tick * px_per_tick(daw)
+            x1 = x0 + block_len(daw.song, block) * px_per_tick(daw)
+            y0, y1 = y + 6, y + daw.track_height - 6
+            dpg.draw_rectangle((x0, y0), (x1, y1), fill=(92, 92, 96, 255) if block.muted else FILL[block.ref.kind], color=(18, 18, 18, 255), rounding=6, parent=DRAWLIST)
+            dpg.draw_text((x0 + 6, y0 + 6), track.name, color=(18, 18, 18, 255), size=14, parent=DRAWLIST)
+            draw_pattern_preview(DRAWLIST, daw, block, x0, y0 + 22, y1 - 4)
 
 
-def redraw_if_needed(daw: DAW) -> None:
-    track_sig = tuple((t.selected, len(t.blocks), tuple((b.start_tick, block_length_ticks(daw.song, b), b.ref.kind, b.ref.object_id, b.muted, b.loop) for b in t.blocks)) for t in daw.song.tracks)
-    sig = (
-        daw.dirty,
-        daw.song.bpm,
-        daw.song.meter.numerator,
-        daw.song.meter.denominator,
-        daw.px_per_beat,
-        daw.track_height,
-        daw.timeline_total_beats,
-        track_sig,
-    )
-    size = tuple(dpg.get_item_rect_size(SCROLLER))
-    cur = (sig, size)
-    if cur != RUNTIME.last_sig:
+def rebuild_rows(daw: DAW) -> None:
+    dpg.delete_item(ROWS, children_only=True)
+    dpg.add_spacer(height=HEADER_H - 4, parent=ROWS)
+    for i, track in enumerate(daw.song.tracks):
+        with dpg.group(horizontal=True, parent=ROWS):
+            dpg.add_checkbox(default_value=track.selected, callback=on_track_selected, user_data=(daw, i))
+            dpg.add_input_text(default_value=track.name, width=150, on_enter=True, callback=on_track_name, user_data=(daw, i))
+        dpg.add_spacer(height=max(0, daw.track_height - 22 + TRACK_GAP), parent=ROWS)
+
+
+def redraw(daw: DAW) -> None:
+    if daw.dirty:
         rebuild_rows(daw)
         draw_timeline(daw)
-        RUNTIME.last_sig = cur
         daw.dirty = False
 
 
+# ---------- actions ----------
 def on_track_selected(sender, app_data, user_data):
     daw, i = user_data
-    daw.song.tracks[int(i)].selected = bool(app_data)
-    mark_dirty(daw)
+    do(daw, [("set", ("tracks", i, "selected"), daw.song.tracks[i].selected, bool(app_data))])
+
+
+def on_track_name(sender, app_data, user_data):
+    daw, i = user_data
+    new = app_data or "track"
+    old = daw.song.tracks[i].name
+    if new != old:
+        do(daw, [("set", ("tracks", i, "name"), old, new)])
 
 
 def on_bpm(sender, app_data, user_data):
     daw = user_data
-    daw.song.bpm = max(1.0, float(app_data))
-    mark_dirty(daw)
+    new = max(1.0, float(app_data))
+    if new != daw.song.bpm:
+        do(daw, [("set", ("bpm",), daw.song.bpm, new)])
 
 
 def on_meter_num(sender, app_data, user_data):
     daw = user_data
-    daw.song.meter.numerator = max(1, int(app_data))
-    mark_dirty(daw)
+    new = max(1, int(app_data))
+    if new != daw.song.meter.numerator:
+        do(daw, [("set", ("meter", "numerator"), daw.song.meter.numerator, new)])
 
 
 def on_meter_den(sender, app_data, user_data):
     daw = user_data
-    daw.song.meter.denominator = max(1, int(app_data))
-    mark_dirty(daw)
+    new = max(1, int(app_data))
+    if new != daw.song.meter.denominator:
+        do(daw, [("set", ("meter", "denominator"), daw.song.meter.denominator, new)])
 
 
-def on_px_per_beat(sender, app_data, user_data):
+def on_px(sender, app_data, user_data):
     daw = user_data
-    daw.px_per_beat = max(8.0, min(240.0, float(app_data)))
-    mark_dirty(daw)
+    new = max(8.0, float(app_data))
+    if new != daw.px_per_beat:
+        daw.px_per_beat = new
+        daw.dirty = True
 
 
-def on_track_height(sender, app_data, user_data):
+def on_track_h(sender, app_data, user_data):
     daw = user_data
-    daw.track_height = max(40, min(320, int(app_data)))
-    mark_dirty(daw)
+    new = max(36, int(app_data))
+    if new != daw.track_height:
+        daw.track_height = new
+        daw.dirty = True
+
+
+def on_add_track(sender, app_data, user_data):
+    daw = user_data
+    tid = len(daw.song.tracks)
+    track = Track(f"track {tid}", Instrument())
+    do(daw, [("insert", ("tracks",), len(daw.song.tracks), track)], "added track")
+
+
+def on_del_track(sender, app_data, user_data):
+    daw = user_data
+    if not daw.song.tracks:
+        return
+    i = max([j for j, t in enumerate(daw.song.tracks) if t.selected], default=len(daw.song.tracks) - 1)
+    do(daw, [("delete", ("tracks",), i, daw.song.tracks[i])], "deleted track")
+
+
+def on_add_block(sender, app_data, user_data):
+    daw = user_data
+    if not daw.song.tracks:
+        return
+    i = max([j for j, t in enumerate(daw.song.tracks) if t.selected], default=0)
+    tpb = ticks_per_beat(daw.song)
+    track = daw.song.tracks[i]
+    start = max((b.start_tick + block_len(daw.song, b) for b in track.blocks), default=0)
+    pid = default_pattern(daw.song) if "808" not in track.name.lower() else 0
+    ref = BlockRef(BlockKind.PATTERN, default_pattern(daw.song)) if "808" not in track.name.lower() else BlockRef(BlockKind.PIANO_ROLL, 0)
+    block = Block(ref, start, 4 * tpb)
+    do(daw, [("insert", ("tracks", i, "blocks"), len(track.blocks), block)], "added block")
+
+
+def on_del_block(sender, app_data, user_data):
+    daw = user_data
+    chosen = [(i, t) for i, t in enumerate(daw.song.tracks) if t.selected and t.blocks]
+    if not chosen:
+        return
+    i, track = chosen[-1]
+    j = len(track.blocks) - 1
+    do(daw, [("delete", ("tracks", i, "blocks"), j, track.blocks[j])], "deleted block")
+
+
+def on_nudge(sender, app_data, user_data):
+    daw, delta = user_data
+    for i, track in enumerate(daw.song.tracks):
+        if track.selected:
+            ops = [("set", ("tracks", i, "blocks", j, "start_tick"), b.start_tick, max(0, b.start_tick + delta)) for j, b in enumerate(track.blocks)]
+            do(daw, ops, "nudged blocks")
+            return
 
 
 def on_export(sender, app_data, user_data):
     daw = user_data
-    write_wav("block_daw_export.wav", render_song_to_samples(daw.song))
-    active = [t.name for t in selected_tracks(daw.song)]
-    mark_dirty(daw, f"wrote block_daw_export.wav from: {', '.join(active)}")
+    write_wav("block_daw_export.wav", render_song(daw.song))
+    if dpg.does_item_exist("status"):
+        dpg.set_value("status", "wrote block_daw_export.wav")
 
 
+def on_key_z(sender, app_data, user_data):
+    daw = user_data
+    if dpg.is_key_down(dpg.mvKey_LControl) or dpg.is_key_down(dpg.mvKey_RControl):
+        undo(daw)
+
+
+def on_key_r(sender, app_data, user_data):
+    daw = user_data
+    if dpg.is_key_down(dpg.mvKey_LControl) or dpg.is_key_down(dpg.mvKey_RControl):
+        redo(daw)
+
+
+# ---------- app ----------
 def Render(daw: DAW) -> None:
     dpg.create_context()
-    dpg.create_viewport(title="Block DAW Minimal", width=1600, height=920, min_width=1100, min_height=700, resizable=True)
-
-    with dpg.window(tag="root", no_title_bar=True, no_move=True, no_resize=True, no_close=True):
-        with dpg.group(horizontal=True, tag=TOP_BAR):
+    with dpg.handler_registry():
+        dpg.add_key_press_handler(dpg.mvKey_Z, callback=on_key_z, user_data=daw)
+        dpg.add_key_press_handler(dpg.mvKey_R, callback=on_key_r, user_data=daw)
+    with dpg.window(tag=ROOT, label="block daw"):
+        with dpg.group(horizontal=True):
             dpg.add_text("BPM")
-            dpg.add_input_float(tag=BPM, width=90, step=1.0, callback=on_bpm, user_data=daw, format="%.1f")
-            dpg.add_spacer(width=8)
+            dpg.add_input_float(default_value=daw.song.bpm, width=90, callback=on_bpm, user_data=daw, format="%.1f")
             dpg.add_text("Meter")
-            dpg.add_input_int(tag=METER_NUM, width=70, callback=on_meter_num, user_data=daw)
+            dpg.add_input_int(default_value=daw.song.meter.numerator, width=60, callback=on_meter_num, user_data=daw)
             dpg.add_text("/")
-            dpg.add_input_int(tag=METER_DEN, width=70, callback=on_meter_den, user_data=daw)
-            dpg.add_spacer(width=8)
+            dpg.add_input_int(default_value=daw.song.meter.denominator, width=60, callback=on_meter_den, user_data=daw)
             dpg.add_text("px/beat")
-            dpg.add_input_float(tag=PX, width=100, step=2.0, callback=on_px_per_beat, user_data=daw, format="%.1f")
-            dpg.add_spacer(width=8)
+            dpg.add_input_float(default_value=daw.px_per_beat, width=90, callback=on_px, user_data=daw, format="%.1f")
             dpg.add_text("h/track")
-            dpg.add_input_int(tag=TRACK_H, width=90, callback=on_track_height, user_data=daw)
-            dpg.add_spacer(width=10)
+            dpg.add_input_int(default_value=daw.track_height, width=70, callback=on_track_h, user_data=daw)
+            dpg.add_button(label="+ track", callback=on_add_track, user_data=daw)
+            dpg.add_button(label="- track", callback=on_del_track, user_data=daw)
+            dpg.add_button(label="+ block", callback=on_add_block, user_data=daw)
+            dpg.add_button(label="- block", callback=on_del_block, user_data=daw)
+            dpg.add_button(label="< beat", callback=on_nudge, user_data=(daw, -ticks_per_beat(daw.song)))
+            dpg.add_button(label="> beat", callback=on_nudge, user_data=(daw, ticks_per_beat(daw.song)))
             dpg.add_button(label="Export WAV", callback=on_export, user_data=daw)
-            dpg.add_spacer(width=14)
-            dpg.add_text("", tag=STATUS)
-
+            dpg.add_text("", tag="status")
         dpg.add_separator()
         with dpg.group(horizontal=True):
             with dpg.child_window(width=210, autosize_y=True, border=False):
-                dpg.add_text("Tracks")
-                dpg.add_separator()
                 dpg.add_child_window(tag=ROWS, autosize_x=True, autosize_y=True, border=False)
             with dpg.child_window(tag=SCROLLER, autosize_x=True, autosize_y=True, border=False, horizontal_scrollbar=True):
-                dpg.add_drawlist(tag=DRAWLIST, width=3000, height=800)
-
-    sync_top_bar(daw)
-    rebuild_rows(daw)
+                dpg.add_drawlist(tag=DRAWLIST, width=4000, height=900)
+    dpg.create_viewport(title="block daw", width=1600, height=920)
     dpg.setup_dearpygui()
     dpg.show_viewport()
-    dpg.set_primary_window("root", True)
-
+    dpg.set_primary_window(ROOT, True)
     while dpg.is_dearpygui_running():
-        vpw = dpg.get_viewport_client_width()
-        vph = dpg.get_viewport_client_height()
-        dpg.configure_item("root", width=vpw, height=vph)
-        redraw_if_needed(daw)
+        dpg.configure_item(ROOT, width=dpg.get_viewport_client_width(), height=dpg.get_viewport_client_height())
+        redraw(daw)
         dpg.render_dearpygui_frame()
-
     dpg.destroy_context()
 
 
