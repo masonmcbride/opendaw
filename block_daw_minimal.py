@@ -96,6 +96,23 @@ class Song:
 
 
 @dataclass
+class Interaction:
+    focused_block: tuple[int, int] | None = None
+    focused_track: int | None = None
+    hover_block: tuple[int, int] | None = None
+    mode: str | None = None
+    mouse_down: bool = False
+    drag_origin_tick: int = 0
+    drag_origin_start: int = 0
+    drag_origin_len: int = 0
+    drag_origin_track: int | None = None
+    drag_offset_tick: int = 0
+    preview_track: int | None = None
+    preview_start: int | None = None
+    preview_len: int | None = None
+
+
+@dataclass
 class DAW:
     song: Song
     px_per_beat: float = 48.0
@@ -104,6 +121,7 @@ class DAW:
     undo: list[list[tuple]] = field(default_factory=list)
     redo: list[list[tuple]] = field(default_factory=list)
     dirty: bool = True
+    ui: Interaction = field(default_factory=Interaction)
 
 
 # ---------- time ----------
@@ -343,6 +361,95 @@ LANE_BG, LANE_BORDER = (22, 22, 24, 255), (70, 70, 76, 255)
 GRID_MINOR, GRID_MAJOR = (45, 45, 48, 255), (214, 178, 42, 255)
 TEXT, TEXT_SOFT = (238, 214, 96, 255), (220, 220, 220, 255)
 FILL = {BlockKind.PATTERN: (184, 146, 28, 255), BlockKind.PIANO_ROLL: (214, 178, 42, 255), BlockKind.RECORDING: (140, 114, 30, 255)}
+EDGE_PX = 8
+
+
+def lane_top(i: int, daw: DAW) -> float:
+    return HEADER_H + TOP_PAD + i * (daw.track_height + TRACK_GAP)
+
+
+def block_rect(daw: DAW, track_i: int, block_i: int, block: Block) -> tuple[float, float, float, float]:
+    view_track = display_track_index(daw, track_i, block_i)
+    start_tick, length_ticks = display_start_len(daw, track_i, block_i, block)
+    y = lane_top(view_track, daw)
+    x0 = LEFT_PAD + start_tick * px_per_tick(daw)
+    x1 = x0 + length_ticks * px_per_tick(daw)
+    return x0, y + 6, x1, y + daw.track_height - 6
+
+
+def y_to_track(daw: DAW, y: float) -> int | None:
+    for i in range(len(daw.song.tracks)):
+        y0 = lane_top(i, daw)
+        y1 = y0 + daw.track_height
+        if y0 <= y <= y1:
+            return i
+    return None
+
+
+def x_to_tick(daw: DAW, x: float) -> int:
+    return max(0, int(round((x - LEFT_PAD) / px_per_tick(daw))))
+
+
+def snap_tick_to_beat(song: Song, tick: int) -> int:
+    tpb = ticks_per_beat(song)
+    return max(0, round(tick / tpb) * tpb)
+
+
+def mouse_in_timeline() -> tuple[float, float] | None:
+    try:
+        mx, my = dpg.get_mouse_pos(local=False)
+        try:
+            state = dpg.get_item_state(SCROLLER)
+        except Exception:
+            state = None
+        if state and "rect_min" in state:
+            wx, wy = state["rect_min"]
+        elif state and "pos" in state:
+            wx, wy = state["pos"]
+        else:
+            wx, wy = dpg.get_item_pos(SCROLLER)
+        return mx - wx + dpg.get_x_scroll(SCROLLER), my - wy + dpg.get_y_scroll(SCROLLER)
+    except Exception:
+        return None
+
+def preview_block_tuple(daw: DAW) -> tuple[int, int] | None:
+    return daw.ui.focused_block if daw.ui.mouse_down and daw.ui.mode in {"move", "resize_left", "resize_right"} else None
+
+
+def display_track_index(daw: DAW, track_i: int, block_i: int) -> int:
+    active = preview_block_tuple(daw)
+    if active == (track_i, block_i) and daw.ui.preview_track is not None:
+        return daw.ui.preview_track
+    return track_i
+
+
+def display_start_len(daw: DAW, track_i: int, block_i: int, block: Block) -> tuple[int, int]:
+    active = preview_block_tuple(daw)
+    if active == (track_i, block_i) and daw.ui.preview_start is not None and daw.ui.preview_len is not None:
+        return daw.ui.preview_start, daw.ui.preview_len
+    return block.start_tick, block_len(daw.song, block)
+
+
+def hit_block(daw: DAW, x: float, y: float):
+    for i, track in enumerate(daw.song.tracks):
+        for j in range(len(track.blocks) - 1, -1, -1):
+            x0, y0, x1, y1 = block_rect(daw, i, j, track.blocks[j])
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                return i, j
+    return None
+
+
+def hit_block_edge(daw: DAW, x: float, y: float):
+    hit = hit_block(daw, x, y)
+    if hit is None:
+        return None
+    i, j = hit
+    x0, _, x1, _ = block_rect(daw, i, j, daw.song.tracks[i].blocks[j])
+    if abs(x - x0) <= EDGE_PX:
+        return "resize_left", i, j
+    if abs(x - x1) <= EDGE_PX:
+        return "resize_right", i, j
+    return None
 
 
 def draw_pattern_preview(drawlist: str, daw: DAW, block: Block, x0: float, y0: float, y1: float) -> None:
@@ -398,11 +505,24 @@ def draw_timeline(daw: DAW) -> None:
     for i, track in enumerate(daw.song.tracks):
         y = HEADER_H + TOP_PAD + i * (daw.track_height + TRACK_GAP)
         dpg.draw_rectangle((LEFT_PAD, y), (cw - LEFT_PAD, y + daw.track_height), fill=LANE_BG, color=LANE_BORDER, rounding=6, parent=DRAWLIST)
-        for block in sorted(track.blocks, key=lambda b: b.start_tick):
-            x0 = LEFT_PAD + block.start_tick * px_per_tick(daw)
-            x1 = x0 + block_len(daw.song, block) * px_per_tick(daw)
+        for j, block in sorted(enumerate(track.blocks), key=lambda p: display_start_len(daw, i, p[0], p[1])[0]):
+            view_track = display_track_index(daw, i, j)
+            if view_track != i:
+                continue
+            start_tick, length_ticks = display_start_len(daw, i, j, block)
+            x0 = LEFT_PAD + start_tick * px_per_tick(daw)
+            x1 = x0 + length_ticks * px_per_tick(daw)
             y0, y1 = y + 6, y + daw.track_height - 6
-            dpg.draw_rectangle((x0, y0), (x1, y1), fill=(92, 92, 96, 255) if block.muted else FILL[block.ref.kind], color=(18, 18, 18, 255), rounding=6, parent=DRAWLIST)
+            focused = daw.ui.focused_block == (i, j)
+            dpg.draw_rectangle(
+                (x0, y0),
+                (x1, y1),
+                fill=(92, 92, 96, 255) if block.muted else FILL[block.ref.kind],
+                color=(255, 255, 255, 255) if focused else (18, 18, 18, 255),
+                thickness=3 if focused else 1,
+                rounding=6,
+                parent=DRAWLIST,
+            )
             dpg.draw_text((x0 + 6, y0 + 6), track.name, color=(18, 18, 18, 255), size=14, parent=DRAWLIST)
             draw_pattern_preview(DRAWLIST, daw, block, x0, y0 + 22, y1 - 4)
 
@@ -490,37 +610,170 @@ def on_del_track(sender, app_data, user_data):
     do(daw, [("delete", ("tracks",), i, daw.song.tracks[i])], "deleted track")
 
 
-def on_add_block(sender, app_data, user_data):
-    daw = user_data
-    if not daw.song.tracks:
+def make_block_for_track(song: Song, track: Track, start_tick: int) -> Block:
+    ref = BlockRef(BlockKind.PIANO_ROLL, 0) if "808" in track.name.lower() else BlockRef(BlockKind.PATTERN, default_pattern(song))
+    return Block(ref, start_tick, ticks_per_bar(song))
+
+
+def focus_block(daw: DAW, track_i: int, block_i: int):
+    daw.ui.focused_track = track_i
+    daw.ui.focused_block = (track_i, block_i)
+    block = daw.song.tracks[track_i].blocks[block_i]
+    print("focused block", {
+        "track": track_i,
+        "block": block_i,
+        "kind": block.ref.kind,
+        "object_id": block.ref.object_id,
+        "start_tick": block.start_tick,
+        "length_ticks": block_len(daw.song, block),
+    })
+    daw.dirty = True
+
+
+def add_block_at_click(daw: DAW, track_i: int, tick: int):
+    track = daw.song.tracks[track_i]
+    start = (tick // ticks_per_bar(daw.song)) * ticks_per_bar(daw.song)
+    block = make_block_for_track(daw.song, track, start)
+    j = len(track.blocks)
+    do(daw, [("insert", ("tracks", track_i, "blocks"), j, block)], "added block")
+    daw.ui.focused_track = track_i
+    daw.ui.focused_block = (track_i, j)
+
+
+def reset_drag_preview(daw: DAW):
+    daw.ui.mode = None
+    daw.ui.mouse_down = False
+    daw.ui.drag_origin_track = None
+    daw.ui.drag_offset_tick = 0
+    daw.ui.preview_track = None
+    daw.ui.preview_start = None
+    daw.ui.preview_len = None
+
+
+def begin_drag(daw: DAW, mode: str, track_i: int, block_i: int, tick: int):
+    focus_block(daw, track_i, block_i)
+    block = daw.song.tracks[track_i].blocks[block_i]
+    daw.ui.mode = mode
+    daw.ui.mouse_down = True
+    daw.ui.drag_origin_tick = tick
+    daw.ui.drag_origin_track = track_i
+    daw.ui.drag_origin_start = block.start_tick
+    daw.ui.drag_origin_len = block_len(daw.song, block)
+    daw.ui.drag_offset_tick = tick - block.start_tick
+    daw.ui.preview_track = track_i
+    daw.ui.preview_start = block.start_tick
+    daw.ui.preview_len = block_len(daw.song, block)
+
+
+def update_drag_preview(daw: DAW, tick: int, y: float):
+    if daw.ui.focused_block is None or daw.ui.mode is None:
         return
-    i = max([j for j, t in enumerate(daw.song.tracks) if t.selected], default=0)
     tpb = ticks_per_beat(daw.song)
-    track = daw.song.tracks[i]
-    start = max((b.start_tick + block_len(daw.song, b) for b in track.blocks), default=0)
-    pid = default_pattern(daw.song) if "808" not in track.name.lower() else 0
-    ref = BlockRef(BlockKind.PATTERN, default_pattern(daw.song)) if "808" not in track.name.lower() else BlockRef(BlockKind.PIANO_ROLL, 0)
-    block = Block(ref, start, 4 * tpb)
-    do(daw, [("insert", ("tracks", i, "blocks"), len(track.blocks), block)], "added block")
+    min_len = tpb
+    origin_track = daw.ui.drag_origin_track if daw.ui.drag_origin_track is not None else daw.ui.focused_block[0]
+    origin_start = daw.ui.drag_origin_start
+    origin_len = daw.ui.drag_origin_len
+    origin_end = origin_start + origin_len
+    if daw.ui.mode == "move":
+        preview_track = y_to_track(daw, y)
+        if preview_track is None:
+            preview_track = origin_track
+        preview_start = snap_tick_to_beat(daw.song, tick - daw.ui.drag_offset_tick)
+        daw.ui.preview_track = preview_track
+        daw.ui.preview_start = preview_start
+        daw.ui.preview_len = origin_len
+    elif daw.ui.mode == "resize_left":
+        new_start = max(0, min(snap_tick_to_beat(daw.song, tick), origin_end - min_len))
+        daw.ui.preview_track = origin_track
+        daw.ui.preview_start = new_start
+        daw.ui.preview_len = origin_end - new_start
+    elif daw.ui.mode == "resize_right":
+        new_end = max(origin_start + min_len, snap_tick_to_beat(daw.song, tick))
+        daw.ui.preview_track = origin_track
+        daw.ui.preview_start = origin_start
+        daw.ui.preview_len = new_end - origin_start
+    daw.dirty = True
 
 
-def on_del_block(sender, app_data, user_data):
-    daw = user_data
-    chosen = [(i, t) for i, t in enumerate(daw.song.tracks) if t.selected and t.blocks]
-    if not chosen:
+def commit_drag(daw: DAW):
+    active = daw.ui.focused_block
+    if active is None or daw.ui.drag_origin_track is None or daw.ui.preview_start is None or daw.ui.preview_len is None or daw.ui.preview_track is None:
+        reset_drag_preview(daw)
         return
-    i, track = chosen[-1]
-    j = len(track.blocks) - 1
-    do(daw, [("delete", ("tracks", i, "blocks"), j, track.blocks[j])], "deleted block")
+    origin_track_i, origin_block_i = active
+    dest_track_i = daw.ui.preview_track
+    src_track = daw.song.tracks[origin_track_i]
+    block = src_track.blocks[origin_block_i]
+    ops = []
+    if daw.ui.mode == "move":
+        moved_tracks = dest_track_i != origin_track_i
+        moved_start = daw.ui.preview_start != daw.ui.drag_origin_start
+        if moved_tracks:
+            moved_block = Block(block.ref, daw.ui.preview_start, daw.ui.preview_len, block.loop, block.muted)
+            dest_index = len(daw.song.tracks[dest_track_i].blocks)
+            ops = [
+                ("delete", ("tracks", origin_track_i, "blocks"), origin_block_i, block),
+                ("insert", ("tracks", dest_track_i, "blocks"), dest_index, moved_block),
+            ]
+            if ops:
+                do(daw, ops, "moved block")
+                daw.ui.focused_track = dest_track_i
+                daw.ui.focused_block = (dest_track_i, dest_index)
+        elif moved_start:
+            ops = [
+                ("set", ("tracks", origin_track_i, "blocks", origin_block_i, "start_tick"), daw.ui.drag_origin_start, daw.ui.preview_start),
+            ]
+            do(daw, ops, "moved block")
+    elif daw.ui.mode in {"resize_left", "resize_right"}:
+        if daw.ui.preview_start != daw.ui.drag_origin_start:
+            ops.append(("set", ("tracks", origin_track_i, "blocks", origin_block_i, "start_tick"), daw.ui.drag_origin_start, daw.ui.preview_start))
+        if daw.ui.preview_len != daw.ui.drag_origin_len:
+            ops.append(("set", ("tracks", origin_track_i, "blocks", origin_block_i, "length_ticks"), daw.ui.drag_origin_len, daw.ui.preview_len))
+        if ops:
+            do(daw, ops, "resized block")
+    reset_drag_preview(daw)
+    daw.dirty = True
 
 
-def on_nudge(sender, app_data, user_data):
-    daw, delta = user_data
-    for i, track in enumerate(daw.song.tracks):
-        if track.selected:
-            ops = [("set", ("tracks", i, "blocks", j, "start_tick"), b.start_tick, max(0, b.start_tick + delta)) for j, b in enumerate(track.blocks)]
-            do(daw, ops, "nudged blocks")
-            return
+def on_mouse_down(sender, app_data, user_data):
+    daw = user_data
+    if not dpg.is_item_hovered(SCROLLER):
+        return
+    pos = mouse_in_timeline()
+    if pos is None:
+        return
+    x, y = pos
+    if x < LEFT_PAD or y < HEADER_H:
+        return
+    tick = x_to_tick(daw, x)
+    edge = hit_block_edge(daw, x, y)
+    if edge is not None:
+        mode, track_i, block_i = edge
+        begin_drag(daw, mode, track_i, block_i, tick)
+        return
+    hit = hit_block(daw, x, y)
+    if hit is not None:
+        track_i, block_i = hit
+        begin_drag(daw, "move", track_i, block_i, tick)
+        return
+    track_i = y_to_track(daw, y)
+    if track_i is not None:
+        add_block_at_click(daw, track_i, tick)
+
+
+def on_mouse_drag(sender, app_data, user_data):
+    daw = user_data
+    if not daw.ui.mouse_down or daw.ui.mode is None:
+        return
+    pos = mouse_in_timeline()
+    if pos is None:
+        return
+    x, y = pos
+    update_drag_preview(daw, x_to_tick(daw, x), y)
+
+
+def on_mouse_release(sender, app_data, user_data):
+    commit_drag(user_data)
 
 
 def on_export(sender, app_data, user_data):
@@ -548,6 +801,9 @@ def Render(daw: DAW) -> None:
     with dpg.handler_registry():
         dpg.add_key_press_handler(dpg.mvKey_Z, callback=on_key_z, user_data=daw)
         dpg.add_key_press_handler(dpg.mvKey_R, callback=on_key_r, user_data=daw)
+        dpg.add_mouse_down_handler(callback=on_mouse_down, user_data=daw)
+        dpg.add_mouse_drag_handler(callback=on_mouse_drag, user_data=daw)
+        dpg.add_mouse_release_handler(callback=on_mouse_release, user_data=daw)
     with dpg.window(tag=ROOT, label="block daw"):
         with dpg.group(horizontal=True):
             dpg.add_text("BPM")
@@ -562,10 +818,6 @@ def Render(daw: DAW) -> None:
             dpg.add_input_int(default_value=daw.track_height, width=70, callback=on_track_h, user_data=daw)
             dpg.add_button(label="+ track", callback=on_add_track, user_data=daw)
             dpg.add_button(label="- track", callback=on_del_track, user_data=daw)
-            dpg.add_button(label="+ block", callback=on_add_block, user_data=daw)
-            dpg.add_button(label="- block", callback=on_del_block, user_data=daw)
-            dpg.add_button(label="< beat", callback=on_nudge, user_data=(daw, -ticks_per_beat(daw.song)))
-            dpg.add_button(label="> beat", callback=on_nudge, user_data=(daw, ticks_per_beat(daw.song)))
             dpg.add_button(label="Export WAV", callback=on_export, user_data=daw)
             dpg.add_text("", tag="status")
         dpg.add_separator()
