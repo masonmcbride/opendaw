@@ -414,7 +414,7 @@ def draw_pattern_preview(drawlist: str, daw: DAW, block: Block, x0: float, y0: f
         ny0 = y1 - 10 - ((note.pitch - lo) / span) * max(12, y1 - y0 - 18)
         nx0 = x0 + note.start_tick * px_per_tick(daw)
         nx1 = max(nx0 + max(3.0, ppt * 0.15), nx0 + note.length_ticks * px_per_tick(daw))
-        dpg.draw_rectangle((nx0, ny0), (nx1, ny0 + 6), fill=(30, 30, 30, 255), color=(30, 30, 30, 255), parent=drawlist)
+        dpg.draw_rectangle((nx0, ny0), (nx1, ny0 + 2), fill=(30, 30, 30, 255), color=(30, 30, 30, 255), parent=drawlist)
 
 def draw_header(daw: DAW, w: int, h: int) -> None:
     tpb, bar = ticks_per_beat(daw.song), ticks_per_bar(daw.song)
