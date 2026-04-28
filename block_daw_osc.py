@@ -242,7 +242,8 @@ def make_demo_daw() -> DAW:
     snare = Instrument([Oscillator("square", 1.0)], decay=0.05, noise=0.65, click=0.08, drive=0.25)
     hat = Instrument([Oscillator("noise", 1.0)], decay=0.02, noise=0.85, drive=0.10)
     bass = Instrument([Oscillator("sine", 0.62), Oscillator("sine", 0.10, detune_cents=4.0, wobble_to_pitch=0.03)], decay=0.55, sustain=0.88, release=0.30, pitch_drop=10.0, click=0.008, sub_gain=0.55, filter_mode="lowpass", filter_cutoff=115.0, filter_resonance=0.08, filter_env_amount=0.8, wobble_rate=0.55, wobble_depth=0.10, wobble_shape="sine", drive=0.10, gain=0.34)
-    organ = Instrument([Oscillator("saw", 0.70), Oscillator("square", 0.18, detune_cents=5.0)], attack=0.03, decay=0.55, sustain=0.72, release=0.42, noise=0.025, click=0.01, sub_gain=0.08, filter_mode="lowpass", filter_cutoff=2200.0, filter_resonance=0.08, filter_env_amount=0.35, drive=0.12)
+    organ = Instrument([Oscillator("square", 0.62, detune_cents=-11.0, wobble_to_pitch=0.18), Oscillator("square", 0.44, detune_cents=13.0, phase_offset=0.23, wobble_to_pitch=0.16), Oscillator("saw", 0.18, detune_semitones=12.0, detune_cents=5.0, phase_offset=0.41, wobble_to_pitch=0.10)], attack=0.004, decay=0.22, sustain=0.28, release=1.25, noise=0.035, click=0.0, sub_gain=0.0, filter_mode="lowpass", filter_cutoff=420.0, filter_resonance=0.42, filter_env_amount=1.65, wobble_rate=7.8, wobble_depth=0.22, wobble_shape="sine", drive=0.52, gain=0.42)
+
     bars = lambda ref, n, length=bar: [Block(ref, i * bar, length) for i in range(n)]
     song.tracks = [
         Track("kick", kick, True, bars(BlockRef(BlockKind.PATTERN, 0), 4)),

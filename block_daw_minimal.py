@@ -552,7 +552,7 @@ def on_mouse_drag(sender, app_data, daw):
 def on_mouse_release(sender, app_data, daw): commit_drag(daw)
 
 def on_export(sender, app_data, daw):
-    write_wav("block_daw_export.wav", render_song(daw.song))
+    write_wav("block_daw_export2.wav", render_song(daw.song))
     if dpg.does_item_exist("status"): dpg.set_value("status", "wrote block_daw_export.wav")
 
 def on_key_z(sender, app_data, daw):
